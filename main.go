@@ -12,6 +12,9 @@ import (
 	"strconv"
 
 	"cloud.google.com/go/storage"
+	jwtmiddleware "github.com/auth0/go-jwt-middleware"
+	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
 	"github.com/olivere/elastic"
 	"github.com/pborman/uuid"
 )
@@ -20,7 +23,7 @@ const (
 	POST_INDEX = "post"
 	DISTANCE   = "200km"
 
-	ES_URL      = "http://35.188.213.121:9200"
+	ES_URL      = "http://10.128.0.2:9200"
 	BUCKET_NAME = "dal185-bucket"
 )
 
@@ -44,7 +47,6 @@ type Location struct {
 }
 
 type Post struct {
-	// `json:"user"` is for the json parsing of this User field. Otherwise, by default it's 'User'.
 	User     string   `json:"user"`
 	Message  string   `json:"message"`
 	Location Location `json:"location"`
@@ -56,21 +58,43 @@ type Post struct {
 func main() {
 	fmt.Println("started-service")
 
-	http.HandleFunc("/post", handlerPost)
-	http.HandleFunc("/search", handlerSearch)
-	http.HandleFunc("/cluster", handlerCluster)
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	jwtMiddleware := jwtmiddleware.New(jwtmiddleware.Options{
+		ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+			return []byte(mySigningKey), nil
+		},
+		SigningMethod: jwt.SigningMethodHS256,
+	})
+
+	r := mux.NewRouter()
+
+	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST", "OPTIONS")
+	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET", "OPTIONS")
+	r.Handle("/cluster", jwtMiddleware.Handler(http.HandlerFunc(handlerCluster))).Methods("GET", "OPTIONS")
+	r.Handle("/signup", http.HandlerFunc(handlerSignup)).Methods("POST", "OPTIONS")
+	r.Handle("/login", http.HandlerFunc(handlerLogin)).Methods("POST", "OPTIONS")
+
+	log.Fatal(http.ListenAndServe(":8080", r))
 }
 
 func handlerPost(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Received one post request")
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	user := r.Context().Value("user")
+	claims := user.(*jwt.Token).Claims
+	username := claims.(jwt.MapClaims)["username"]
 
 	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
 	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
 
 	p := &Post{
-		User:    r.FormValue("user"),
+		User:    username.(string),
 		Message: r.FormValue("message"),
 		Location: Location{
 			Lat: lat,
@@ -120,29 +144,6 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func handlerCluster(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Received one cluster request")
-	w.Header().Set("Content-Type", "application/json")
-
-	term := r.URL.Query().Get("term")
-	query := elastic.NewRangeQuery(term).Gte(0.9)
-
-	searchResult, err := readFromES(query, POST_INDEX)
-	if err != nil {
-		http.Error(w, "Failed to read from Elasticsearch", http.StatusInternalServerError)
-		return
-	}
-
-	posts := getPostFromSearchResult(searchResult)
-	js, err := json.Marshal(posts)
-	if err != nil {
-		http.Error(w, "Failed to parse post object", http.StatusInternalServerError)
-		fmt.Printf("Failed to parse post object %v\n", err)
-		return
-	}
-	w.Write(js)
-}
-
 func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Received one request for search")
 
@@ -154,7 +155,6 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// get parameter from request
 	lat, _ := strconv.ParseFloat(r.URL.Query().Get("lat"), 64)
 	lon, _ := strconv.ParseFloat(r.URL.Query().Get("lon"), 64)
 	// range is optional
@@ -164,7 +164,6 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Println("range is ", ran)
 
-	// search posts from elasticsearch
 	query := elastic.NewGeoDistanceQuery("location")
 	query = query.Distance(ran).Lat(lat).Lon(lon)
 	searchResult, err := readFromES(query, POST_INDEX)
@@ -175,7 +174,6 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	posts := getPostFromSearchResult(searchResult)
 
-	// return posts in response body
 	js, err := json.Marshal(posts)
 	if err != nil {
 		http.Error(w, "Failed to parse posts into JSON format", http.StatusInternalServerError)
@@ -186,7 +184,7 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func readFromES(query elastic.Query, index string) (*elastic.SearchResult, error) {
-	client, err := elastic.NewClient(elastic.SetURL(ES_URL))
+	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
 	if err != nil {
 		return nil, err
 	}
@@ -249,8 +247,8 @@ func saveToGCS(r io.Reader, objectName string) (string, error) {
 	return attrs.MediaLink, nil
 }
 
-func saveToES(post *Post, index string, id string) error {
-	client, err := elastic.NewClient(elastic.SetURL(ES_URL))
+func saveToES(i interface{}, index string, id string) error {
+	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
 	if err != nil {
 		return err
 	}
@@ -258,13 +256,41 @@ func saveToES(post *Post, index string, id string) error {
 	_, err = client.Index().
 		Index(index).
 		Id(id).
-		BodyJson(post).
+		BodyJson(i).
 		Do(context.Background())
 
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Post is saved to index: %s\n", post.Message)
 	return nil
+}
+
+func handlerCluster(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("Received one cluster request")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	term := r.URL.Query().Get("term")
+	query := elastic.NewRangeQuery(term).Gte(0.9)
+
+	searchResult, err := readFromES(query, POST_INDEX)
+	if err != nil {
+		http.Error(w, "Failed to read from Elasticsearch", http.StatusInternalServerError)
+		return
+	}
+
+	posts := getPostFromSearchResult(searchResult)
+	js, err := json.Marshal(posts)
+	if err != nil {
+		http.Error(w, "Failed to parse post object", http.StatusInternalServerError)
+		fmt.Printf("Failed to parse post object %v\n", err)
+		return
+	}
+	w.Write(js)
 }
